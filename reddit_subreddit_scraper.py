@@ -148,10 +148,57 @@ async def scrape_subreddit(conn, page: Page, subreddit: str):
 
     try:
         await page.goto(url, timeout=60000, wait_until="networkidle")
-
-        # New Reddit layout: posts are <shreddit-post> elements
-        post_selector = "shreddit-post"
-        await page.wait_for_selector(post_selector, timeout=30000)
+        
+        # Take a screenshot to see what we're getting
+        await page.screenshot(path=f"debug_{subreddit}_loaded.png", full_page=True)
+        
+        # Check what's actually on the page
+        page_content = await page.content()
+        
+        # Check for different possible selectors
+        shreddit_posts = await page.query_selector_all("shreddit-post")
+        old_posts = await page.query_selector_all("div[data-testid='post-container']")
+        thing_posts = await page.query_selector_all("div.thing")
+        
+        print(f"🔍 Debug info:")
+        print(f"  - shreddit-post elements: {len(shreddit_posts)}")
+        print(f"  - post-container elements: {len(old_posts)}")
+        print(f"  - thing elements: {len(thing_posts)}")
+        print(f"  - Page title: {await page.title()}")
+        
+        # Check if we're being blocked or shown a login page
+        if "blocked" in page_content.lower() or "captcha" in page_content.lower():
+            print("⚠️ Possible blocking/CAPTCHA detected")
+        if "log in" in (await page.title()).lower() or "sign up" in page_content.lower()[:5000]:
+            print("⚠️ Possible login wall detected")
+        
+        # Try to use whichever selector works
+        post_selector = None
+        posts = []
+        
+        if len(shreddit_posts) > 0:
+            post_selector = "shreddit-post"
+            posts = shreddit_posts
+            print(f"✅ Using new Reddit layout (shreddit-post)")
+        elif len(old_posts) > 0:
+            post_selector = "div[data-testid='post-container']"
+            posts = old_posts
+            print(f"✅ Using new Reddit layout (post-container)")
+        elif len(thing_posts) > 0:
+            post_selector = "div.thing"
+            posts = old_posts
+            print(f"✅ Using old Reddit layout (thing)")
+        else:
+            print("❌ No recognizable post elements found!")
+            # Save HTML for debugging
+            with open(f"debug_{subreddit}_content.html", "w", encoding="utf-8") as f:
+                f.write(page_content)
+            print(f"💾 Saved page HTML to debug_{subreddit}_content.html")
+            return
+        
+        if not posts:
+            print("⚠️ No posts found after selector detection")
+            return
 
         # Scroll a bit to load more posts
         await load_additional_posts(page)
