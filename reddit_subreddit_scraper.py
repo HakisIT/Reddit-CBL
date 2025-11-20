@@ -21,7 +21,8 @@ POST_MAX_AGE_HOURS = 4
 
 SUBREDDITS = [
     "Outdoors",
-    "Bushcraft"
+    "Bushcraft",
+    "countrygirlsgonewild"
 ]
 
 DB_CONFIG = {
