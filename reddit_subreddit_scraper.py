@@ -1,11 +1,10 @@
 import asyncio
-import os
 import random
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+from typing import Dict, List
 
 import asyncpg
-from playwright.async_api import async_playwright, Page
+import aiohttp
 
 # ====== Human-like rotation config ======
 BATCH_MIN = 13
@@ -21,12 +20,8 @@ POST_MAX_AGE_HOURS = 4
 # ========================================
 
 SUBREDDITS = [
-    "GirlsWithGuns",
-    "CountryGirls",
-    "CamoGirls",
-    "TacticalGirls",
     "Outdoors",
-    "Bushcraft",
+    "Bushcraft"
 ]
 
 DB_CONFIG = {
@@ -37,7 +32,8 @@ DB_CONFIG = {
     "port": 5432
 }
 
-STORAGE_STATE = os.getenv("PLAYWRIGHT_STORAGE_STATE")
+# Realistic user agent
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 
 def _validated_db_config() -> Dict[str, str]:
@@ -68,228 +64,108 @@ async def insert_reddit_post(
     print(f"✅ Saved Reddit post {post_id} from r/{subreddit}")
 
 
-def parse_score(score_attr: Optional[str]) -> int:
-    """Parse score from attribute value (e.g., '301' or '1.5k')"""
-    if not score_attr:
-        return 0
-    
-    cleaned = score_attr.strip().lower()
-    if not cleaned or cleaned in {"•", "-"}:
-        return 0
-    
-    # Remove any text like "points" or "votes"
-    cleaned = cleaned.replace("points", "").replace("point", "")
-    cleaned = cleaned.replace("votes", "").replace("vote", "").strip()
-    
-    multiplier = 1
-    if cleaned.endswith("k"):
-        multiplier = 1000
-        cleaned = cleaned[:-1]
-    elif cleaned.endswith("m"):
-        multiplier = 1000000
-        cleaned = cleaned[:-1]
-    
-    try:
-        value = float(cleaned)
-        return int(value * multiplier)
-    except ValueError:
-        return 0
-
-
-def parse_reddit_timestamp(timestamp_str: str) -> Optional[datetime]:
-    """Parse Reddit's timestamp formats robustly"""
-    if not timestamp_str:
-        return None
-    
-    # Handle different formats:
-    # 1. "2025-11-19T23:20:32.653000+0000" (from created-timestamp attribute)
-    # 2. "2025-11-19T23:20:32.653Z" (from datetime attribute)
-    
-    timestamp_str = timestamp_str.strip()
-    
-    # Replace Z with +00:00 for ISO format
-    if timestamp_str.endswith("Z"):
-        timestamp_str = timestamp_str[:-1] + "+00:00"
-    
-    # Fix +0000 to +00:00 for ISO format
-    elif timestamp_str.endswith("+0000"):
-        timestamp_str = timestamp_str[:-5] + "+00:00"
-    
-    try:
-        dt = datetime.fromisoformat(timestamp_str)
-        # Convert to naive UTC datetime for consistency
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt
-    except (ValueError, AttributeError) as e:
-        print(f"⚠️ Failed to parse timestamp '{timestamp_str}': {e}")
-        return None
-
-
-def extract_post_id_from_url(url: str) -> Optional[str]:
-    """Extract post ID from Reddit URL"""
-    if "/comments/" in url:
-        try:
-            return url.split("/comments/")[1].split("/")[0]
-        except IndexError:
-            pass
-    return None
-
-
-async def load_additional_posts(page: Page, scroll_times: int = 3):
-    for _ in range(scroll_times):
-        await page.mouse.wheel(0, 2000)
-        await asyncio.sleep(random.uniform(0.8, 1.4))
-
-
-async def scrape_subreddit(conn, page: Page, subreddit: str):
+async def scrape_subreddit_json(conn, session: aiohttp.ClientSession, subreddit: str):
+    """Scrape subreddit using Reddit's JSON API"""
     print(f"\n🔍 Scraping r/{subreddit} ...")
-    url = f"https://www.reddit.com/r/{subreddit}/hot/"
-
+    
+    # Reddit JSON API endpoint - add .json to any Reddit URL
+    url = f"https://www.reddit.com/r/{subreddit}/hot.json"
+    
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    
+    params = {
+        "limit": 100,  # Get up to 100 posts
+        "raw_json": 1,  # Don't HTML-escape the JSON
+    }
+    
     try:
-        await page.goto(url, timeout=60000, wait_until="networkidle")
-        
-        # Take a screenshot to see what we're getting
-        await page.screenshot(path=f"debug_{subreddit}_loaded.png", full_page=True)
-        
-        # Check what's actually on the page
-        page_content = await page.content()
-        
-        # Check for different possible selectors
-        shreddit_posts = await page.query_selector_all("shreddit-post")
-        old_posts = await page.query_selector_all("div[data-testid='post-container']")
-        thing_posts = await page.query_selector_all("div.thing")
-        
-        print(f"🔍 Debug info:")
-        print(f"  - shreddit-post elements: {len(shreddit_posts)}")
-        print(f"  - post-container elements: {len(old_posts)}")
-        print(f"  - thing elements: {len(thing_posts)}")
-        print(f"  - Page title: {await page.title()}")
-        
-        # Check if we're being blocked or shown a login page
-        if "blocked" in page_content.lower() or "captcha" in page_content.lower():
-            print("⚠️ Possible blocking/CAPTCHA detected")
-        if "log in" in (await page.title()).lower() or "sign up" in page_content.lower()[:5000]:
-            print("⚠️ Possible login wall detected")
-        
-        # Try to use whichever selector works
-        post_selector = None
-        posts = []
-        
-        if len(shreddit_posts) > 0:
-            post_selector = "shreddit-post"
-            posts = shreddit_posts
-            print(f"✅ Using new Reddit layout (shreddit-post)")
-        elif len(old_posts) > 0:
-            post_selector = "div[data-testid='post-container']"
-            posts = old_posts
-            print(f"✅ Using new Reddit layout (post-container)")
-        elif len(thing_posts) > 0:
-            post_selector = "div.thing"
-            posts = old_posts
-            print(f"✅ Using old Reddit layout (thing)")
-        else:
-            print("❌ No recognizable post elements found!")
-            # Save HTML for debugging
-            with open(f"debug_{subreddit}_content.html", "w", encoding="utf-8") as f:
-                f.write(page_content)
-            print(f"💾 Saved page HTML to debug_{subreddit}_content.html")
-            return
-        
-        if not posts:
-            print("⚠️ No posts found after selector detection")
-            return
-
-        # Scroll a bit to load more posts
-        await load_additional_posts(page)
-
-        posts = await page.query_selector_all(post_selector)
-        valid_count = 0
-
-        for post in posts:
-            try:
-                # Get basic attributes from <shreddit-post>
-                permalink = await post.get_attribute("permalink")
-                title = await post.get_attribute("post-title")
-                created_raw = await post.get_attribute("created-timestamp")
-                score_raw = await post.get_attribute("score")
-                id_attr = await post.get_attribute("id")  # e.g. "t3_1p1n96a"
-
-                if not permalink or not title:
-                    continue
-
-                title = title.strip()
-                if not title:
-                    continue
-
-                # Build full URL
-                if permalink.startswith("/"):
+        async with session.get(url, headers=headers, params=params, timeout=30) as response:
+            print(f"📡 Response status: {response.status}")
+            
+            if response.status == 429:
+                print("🚫 Rate limited! Need to wait longer between requests")
+                return
+            elif response.status == 403:
+                print("🚫 Access forbidden - may need to adjust user agent or IP")
+                return
+            elif response.status != 200:
+                print(f"❌ Unexpected status code: {response.status}")
+                return
+            
+            data = await response.json()
+            
+            if "data" not in data or "children" not in data["data"]:
+                print("⚠️ Unexpected JSON structure")
+                return
+            
+            posts = data["data"]["children"]
+            print(f"📦 Found {len(posts)} posts in API response")
+            
+            valid_count = 0
+            now_utc = datetime.utcnow()
+            
+            for post_data in posts:
+                try:
+                    if post_data.get("kind") != "t3":  # t3 = link/post
+                        continue
+                    
+                    post = post_data.get("data", {})
+                    
+                    # Extract post data
+                    post_id = post.get("id")
+                    title = post.get("title", "").strip()
+                    permalink = post.get("permalink", "")
+                    score = post.get("score", 0)
+                    created_utc = post.get("created_utc")
+                    
+                    if not post_id or not title or not permalink:
+                        continue
+                    
+                    # Build full URL
                     post_url = f"https://www.reddit.com{permalink}"
-                else:
-                    post_url = permalink
-
-                # Extract post_id
-                post_id = None
-                if id_attr and id_attr.startswith("t3_"):
-                    post_id = id_attr[3:]  # Remove "t3_" prefix
-                elif id_attr:
-                    post_id = id_attr
-                else:
-                    post_id = extract_post_id_from_url(post_url)
-                
-                if not post_id:
-                    print(f"⛔ Could not extract post_id from {post_url}")
+                    
+                    # Parse timestamp (created_utc is Unix timestamp)
+                    if not created_utc:
+                        continue
+                    
+                    created_datetime = datetime.utcfromtimestamp(created_utc)
+                    
+                    # Check age
+                    age_hours = (now_utc - created_datetime).total_seconds() / 3600.0
+                    
+                    if age_hours > POST_MAX_AGE_HOURS:
+                        print(f"⛔ Too old ({round(age_hours, 1)}h): {post_id}")
+                        continue
+                    
+                    print(f"✅ Valid post: {title[:50]}... (score: {score}, age: {round(age_hours, 1)}h)")
+                    
+                    await insert_reddit_post(
+                        conn,
+                        subreddit,
+                        post_id,
+                        post_url,
+                        score,
+                        created_datetime,
+                    )
+                    valid_count += 1
+                    
+                except Exception as e:
+                    print(f"⚠️ Error processing post: {e}")
                     continue
-
-                # Parse timestamp
-                datetime_value = None
-                if created_raw:
-                    datetime_value = parse_reddit_timestamp(created_raw)
-                
-                # Fallback to faceplate-timeago if needed
-                if not datetime_value:
-                    time_el = await post.query_selector("faceplate-timeago time")
-                    if time_el:
-                        dt_attr = await time_el.get_attribute("datetime")
-                        if dt_attr:
-                            datetime_value = parse_reddit_timestamp(dt_attr)
-                
-                if not datetime_value:
-                    print(f"⛔ No valid timestamp for post {post_id}")
-                    continue
-
-                # Check age
-                age_hours = (datetime.utcnow() - datetime_value).total_seconds() / 3600.0
-                if age_hours > POST_MAX_AGE_HOURS:
-                    print(f"⛔ Too old ({round(age_hours, 1)}h): {post_id}")
-                    continue
-
-                # Parse score
-                score = parse_score(score_raw)
-
-                print(f"✅ Valid post: {post_url} (score: {score}, age: {round(age_hours, 1)}h)")
-                await insert_reddit_post(
-                    conn,
-                    subreddit,
-                    post_id,
-                    post_url,
-                    score,
-                    datetime_value,
-                )
-                valid_count += 1
-
-            except Exception as e:
-                print(f"⚠️ Error processing individual post: {e}")
-                continue
-
-        if valid_count == 0:
-            print(f"⚠️ No suitable posts found for r/{subreddit}")
-        else:
-            print(f"✅ Found {valid_count} valid posts in r/{subreddit}")
-
+            
+            if valid_count == 0:
+                print(f"⚠️ No suitable posts found for r/{subreddit}")
+            else:
+                print(f"✅ Found {valid_count} valid posts in r/{subreddit}")
+    
+    except asyncio.TimeoutError:
+        print(f"⏱️ Timeout while fetching r/{subreddit}")
     except Exception as e:
         print(f"❌ Error scraping r/{subreddit}: {e}")
-        await page.screenshot(path=f"debug_error_{subreddit}.png", full_page=True)
 
 
 async def get_subreddits_for_this_loop() -> List[str]:
@@ -303,41 +179,34 @@ async def get_subreddits_for_this_loop() -> List[str]:
 async def run_scraper():
     conn = await connect_db()
     print("✅ DB connected!\n")
-
+    
+    # Create persistent HTTP session
+    timeout = aiohttp.ClientTimeout(total=30)
+    
     while True:
         print("⏱️ Checking new reddit posts...\n")
-
+        
         subreddits = await get_subreddits_for_this_loop()
         if not subreddits:
             backoff = random.randint(120, 240)
             print(f"😴 No subreddits configured. Sleeping {backoff}s...\n")
             await asyncio.sleep(backoff)
             continue
-
+        
         random.shuffle(subreddits)
         print(f"🎯 This run will scrape {len(subreddits)} subreddits.\n")
-
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            context_args = {}
-            if STORAGE_STATE:
-                context_args["storage_state"] = STORAGE_STATE
-            context = await browser.new_context(**context_args)
-            page = await context.new_page()
-
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             for subreddit in subreddits:
                 try:
-                    await scrape_subreddit(conn, page, subreddit)
+                    await scrape_subreddit_json(conn, session, subreddit)
                 except Exception as e:
                     print(f"⚠️ Error on r/{subreddit}: {e}")
-
+                
                 wait_s = random.randint(SUBREDDIT_COOLDOWN_MIN_SEC, SUBREDDIT_COOLDOWN_MAX_SEC)
                 print(f"⏳ Cooldown: {wait_s}s\n")
                 await asyncio.sleep(wait_s)
-
-            await context.close()
-            await browser.close()
-
+        
         loop_wait = random.randint(LOOP_DELAY_MIN_SEC, LOOP_DELAY_MAX_SEC)
         mins = round(loop_wait / 60, 1)
         print(f"✅ Run finished. Next loop in ~{mins} min ({loop_wait}s)\n")
@@ -345,5 +214,5 @@ async def run_scraper():
 
 
 if __name__ == "__main__":
-    print("🚀 Starting Reddit subreddit scraper...")
+    print("🚀 Starting Reddit JSON API scraper...")
     asyncio.run(run_scraper())
