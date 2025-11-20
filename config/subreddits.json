@@ -1,0 +1,12 @@
+{
+  "scrape_interval_seconds": 30,
+  "subreddits": [
+    { "name": "GirlsWithGuns", "priority": 1 },
+    { "name": "CountryGirls", "priority": 2 },
+    { "name": "CamoGirls", "priority": 2 },
+    { "name": "TacticalGirls", "priority": 1 },
+    { "name": "Outdoors", "priority": 3 },
+    { "name": "Bushcraft", "priority": 3 }
+  ]
+}
+

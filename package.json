@@ -1,0 +1,22 @@
+{
+  "name": "reddit-cbl-scraper",
+  "version": "1.0.0",
+  "description": "Reddit Comment Boost Ladder - Scraper Module",
+  "type": "module",
+  "main": "scraper/index.js",
+  "scripts": {
+    "start": "node scraper/index.js"
+  },
+  "keywords": ["reddit", "scraper", "automation"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "dayjs": "^1.11.10",
+    "puppeteer": "^24.15.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
+
