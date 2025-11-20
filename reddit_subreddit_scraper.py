@@ -127,76 +127,97 @@ async def scrape_subreddit(conn, page: Page, subreddit: str):
 
     try:
         await page.goto(url, timeout=60000, wait_until="networkidle")
-        await page.wait_for_selector("div[data-testid='post-container'], article[data-testid='post-container']", timeout=20000)
 
+        # New Reddit layout: posts are <shreddit-post> elements
+        post_selector = "shreddit-post"
+        await page.wait_for_selector(post_selector, timeout=30000)
+
+        # Scroll a bit to load more posts
         await load_additional_posts(page)
-        posts = await page.query_selector_all("div[data-testid='post-container'], article[data-testid='post-container']")
+
+        posts = await page.query_selector_all(post_selector)
         valid_count = 0
 
         for post in posts:
-            title_el = await post.query_selector("h3")
-            if not title_el:
+            # ---- basic attributes directly on <shreddit-post> ----
+            permalink = await post.get_attribute("permalink")
+            title = await post.get_attribute("post-title")
+            created_raw = await post.get_attribute("created-timestamp")
+            score_raw = await post.get_attribute("score")
+            id_attr = await post.get_attribute("id")  # e.g. "t3_1p1n96a"
+
+            if not permalink or not title or not created_raw:
+                # Skip incomplete posts
                 continue
-            title = (await title_el.inner_text()).strip()
+
+            title = title.strip()
             if not title:
                 continue
 
-            timestamp_anchor = await post.query_selector("a[data-click-id='timestamp']")
-            time_el = None
-            datetime_value: Optional[datetime] = None
-            if timestamp_anchor:
-                time_el = await timestamp_anchor.query_selector("time")
-
-            if time_el:
-                datetime_str = await time_el.get_attribute("datetime")
-                if datetime_str:
-                    try:
-                        datetime_value = datetime.fromisoformat(datetime_str.replace("Z", "+00:00"))
-                    except ValueError:
-                        datetime_value = None
-            if not datetime_value and timestamp_anchor:
-                timestamp_text = (await timestamp_anchor.inner_text()).strip()
-                datetime_value = parse_age_text(timestamp_text)
-
-            if not datetime_value:
-                print("⛔ No timestamp")
-                continue
-
-            age_hours = (datetime.utcnow() - datetime_value.replace(tzinfo=None)).total_seconds() / 3600
-            if age_hours > POST_MAX_AGE_HOURS:
-                print(f"⛔ Too old ({round(age_hours)}h)")
-                continue
-
-            permalink_el = await post.query_selector("a[data-click-id='comments'], a[data-click-id='body']")
-            if not permalink_el:
-                print("⛔ No permalink")
-                continue
-
-            href = await permalink_el.get_attribute("href")
-            if not href:
-                print("⛔ Empty permalink")
-                continue
-
-            if href.startswith("/"):
-                post_url = f"https://www.reddit.com{href}"
+            # ---- build full URL ----
+            if permalink.startswith("/"):
+                post_url = f"https://www.reddit.com{permalink}"
             else:
-                post_url = href
+                post_url = permalink
 
-            post_id = "unknown"
-            if "/comments/" in post_url:
+            # ---- post_id: use ID attr if available, else parse from URL ----
+            post_id = id_attr or "unknown"
+            if not post_id and "/comments/" in post_url:
                 try:
                     post_id = post_url.split("/comments/")[1].split("/")[0]
                 except IndexError:
                     post_id = post_url
 
-            score_el = await post.query_selector("[data-click-id='score'], div[data-test-id='post-content'] span")
+            # ---- created_at: parse created-timestamp ----
+            # example: "2025-11-19T23:20:32.653000+0000"  (no colon in timezone)
+            created_str = created_raw
+            if created_str.endswith("+0000"):
+                created_str = created_str[:-5] + "+00:00"
+
+            try:
+                datetime_value = datetime.fromisoformat(created_str)
+            except ValueError:
+                # fallback: try time element inside faceplate-timeago, or skip
+                time_el = await post.query_selector("faceplate-timeago time")
+                datetime_value = None
+                if time_el:
+                    dt_attr = await time_el.get_attribute("datetime")
+                    if dt_attr:
+                        try:
+                            datetime_value = datetime.fromisoformat(
+                                dt_attr.replace("Z", "+00:00")
+                            )
+                        except ValueError:
+                            datetime_value = None
+
+            if not datetime_value:
+                print("⛔ No timestamp")
+                continue
+
+            age_hours = (
+                datetime.utcnow() - datetime_value.replace(tzinfo=None)
+            ).total_seconds() / 3600.0
+            if age_hours > POST_MAX_AGE_HOURS:
+                print(f"⛔ Too old ({round(age_hours)}h)")
+                continue
+
+            # ---- score ----
             score = 0
-            if score_el:
-                score_text = (await score_el.inner_text()).strip()
-                score = parse_score_text(score_text)
+            if score_raw:
+                try:
+                    score = int(score_raw)
+                except ValueError:
+                    score = parse_score_text(score_raw)
 
             print(f"✅ Valid new post: {post_url}")
-            await insert_reddit_post(conn, subreddit, post_id, post_url, score, datetime_value.replace(tzinfo=None))
+            await insert_reddit_post(
+                conn,
+                subreddit,
+                post_id,
+                post_url,
+                score,
+                datetime_value.replace(tzinfo=None),
+            )
             valid_count += 1
 
         if valid_count == 0:
