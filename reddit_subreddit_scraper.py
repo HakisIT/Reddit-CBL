@@ -1,7 +1,7 @@
 import asyncio
 import os
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import asyncpg
@@ -40,7 +40,6 @@ DB_CONFIG = {
 STORAGE_STATE = os.getenv("PLAYWRIGHT_STORAGE_STATE")
 
 
-
 def _validated_db_config() -> Dict[str, str]:
     missing = [key for key, value in DB_CONFIG.items() if value in (None, "")]
     if missing:
@@ -69,15 +68,27 @@ async def insert_reddit_post(
     print(f"✅ Saved Reddit post {post_id} from r/{subreddit}")
 
 
-def parse_score_text(score_text: str) -> int:
-    cleaned = score_text.strip().lower().replace("points", "").replace("point", "")
-    cleaned = cleaned.replace("votes", "").replace("vote", "").strip()
-    if not cleaned or cleaned in {"•"}:
+def parse_score(score_attr: Optional[str]) -> int:
+    """Parse score from attribute value (e.g., '301' or '1.5k')"""
+    if not score_attr:
         return 0
+    
+    cleaned = score_attr.strip().lower()
+    if not cleaned or cleaned in {"•", "-"}:
+        return 0
+    
+    # Remove any text like "points" or "votes"
+    cleaned = cleaned.replace("points", "").replace("point", "")
+    cleaned = cleaned.replace("votes", "").replace("vote", "").strip()
+    
     multiplier = 1
     if cleaned.endswith("k"):
         multiplier = 1000
         cleaned = cleaned[:-1]
+    elif cleaned.endswith("m"):
+        multiplier = 1000000
+        cleaned = cleaned[:-1]
+    
     try:
         value = float(cleaned)
         return int(value * multiplier)
@@ -85,34 +96,44 @@ def parse_score_text(score_text: str) -> int:
         return 0
 
 
-def parse_age_text(age_text: str) -> Optional[datetime]:
-    text = age_text.strip().lower()
-    now = datetime.utcnow()
-    if not text:
+def parse_reddit_timestamp(timestamp_str: str) -> Optional[datetime]:
+    """Parse Reddit's timestamp formats robustly"""
+    if not timestamp_str:
         return None
-    if text in {"just now", "moments ago"}:
-        return now
-    parts = text.split()
-    if not parts:
-        return None
+    
+    # Handle different formats:
+    # 1. "2025-11-19T23:20:32.653000+0000" (from created-timestamp attribute)
+    # 2. "2025-11-19T23:20:32.653Z" (from datetime attribute)
+    
+    timestamp_str = timestamp_str.strip()
+    
+    # Replace Z with +00:00 for ISO format
+    if timestamp_str.endswith("Z"):
+        timestamp_str = timestamp_str[:-1] + "+00:00"
+    
+    # Fix +0000 to +00:00 for ISO format
+    elif timestamp_str.endswith("+0000"):
+        timestamp_str = timestamp_str[:-5] + "+00:00"
+    
     try:
-        amount_str = parts[0]
-        if amount_str in {"a", "an"}:
-            amount = 1
-        else:
-            amount = float(amount_str)
-    except ValueError:
+        dt = datetime.fromisoformat(timestamp_str)
+        # Convert to naive UTC datetime for consistency
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except (ValueError, AttributeError) as e:
+        print(f"⚠️ Failed to parse timestamp '{timestamp_str}': {e}")
         return None
-    unit = parts[1] if len(parts) > 1 else ""
-    if "min" in unit:
-        delta = timedelta(minutes=amount)
-    elif "hour" in unit or unit == "h":
-        delta = timedelta(hours=amount)
-    elif "sec" in unit or unit == "s":
-        delta = timedelta(seconds=amount)
-    else:
-        return None
-    return now - delta
+
+
+def extract_post_id_from_url(url: str) -> Optional[str]:
+    """Extract post ID from Reddit URL"""
+    if "/comments/" in url:
+        try:
+            return url.split("/comments/")[1].split("/")[0]
+        except IndexError:
+            pass
+    return None
 
 
 async def load_additional_posts(page: Page, scroll_times: int = 3):
@@ -139,89 +160,85 @@ async def scrape_subreddit(conn, page: Page, subreddit: str):
         valid_count = 0
 
         for post in posts:
-            # ---- basic attributes directly on <shreddit-post> ----
-            permalink = await post.get_attribute("permalink")
-            title = await post.get_attribute("post-title")
-            created_raw = await post.get_attribute("created-timestamp")
-            score_raw = await post.get_attribute("score")
-            id_attr = await post.get_attribute("id")  # e.g. "t3_1p1n96a"
-
-            if not permalink or not title or not created_raw:
-                # Skip incomplete posts
-                continue
-
-            title = title.strip()
-            if not title:
-                continue
-
-            # ---- build full URL ----
-            if permalink.startswith("/"):
-                post_url = f"https://www.reddit.com{permalink}"
-            else:
-                post_url = permalink
-
-            # ---- post_id: use ID attr if available, else parse from URL ----
-            post_id = id_attr or "unknown"
-            if not post_id and "/comments/" in post_url:
-                try:
-                    post_id = post_url.split("/comments/")[1].split("/")[0]
-                except IndexError:
-                    post_id = post_url
-
-            # ---- created_at: parse created-timestamp ----
-            # example: "2025-11-19T23:20:32.653000+0000"  (no colon in timezone)
-            created_str = created_raw
-            if created_str.endswith("+0000"):
-                created_str = created_str[:-5] + "+00:00"
-
             try:
-                datetime_value = datetime.fromisoformat(created_str)
-            except ValueError:
-                # fallback: try time element inside faceplate-timeago, or skip
-                time_el = await post.query_selector("faceplate-timeago time")
+                # Get basic attributes from <shreddit-post>
+                permalink = await post.get_attribute("permalink")
+                title = await post.get_attribute("post-title")
+                created_raw = await post.get_attribute("created-timestamp")
+                score_raw = await post.get_attribute("score")
+                id_attr = await post.get_attribute("id")  # e.g. "t3_1p1n96a"
+
+                if not permalink or not title:
+                    continue
+
+                title = title.strip()
+                if not title:
+                    continue
+
+                # Build full URL
+                if permalink.startswith("/"):
+                    post_url = f"https://www.reddit.com{permalink}"
+                else:
+                    post_url = permalink
+
+                # Extract post_id
+                post_id = None
+                if id_attr and id_attr.startswith("t3_"):
+                    post_id = id_attr[3:]  # Remove "t3_" prefix
+                elif id_attr:
+                    post_id = id_attr
+                else:
+                    post_id = extract_post_id_from_url(post_url)
+                
+                if not post_id:
+                    print(f"⛔ Could not extract post_id from {post_url}")
+                    continue
+
+                # Parse timestamp
                 datetime_value = None
-                if time_el:
-                    dt_attr = await time_el.get_attribute("datetime")
-                    if dt_attr:
-                        try:
-                            datetime_value = datetime.fromisoformat(
-                                dt_attr.replace("Z", "+00:00")
-                            )
-                        except ValueError:
-                            datetime_value = None
+                if created_raw:
+                    datetime_value = parse_reddit_timestamp(created_raw)
+                
+                # Fallback to faceplate-timeago if needed
+                if not datetime_value:
+                    time_el = await post.query_selector("faceplate-timeago time")
+                    if time_el:
+                        dt_attr = await time_el.get_attribute("datetime")
+                        if dt_attr:
+                            datetime_value = parse_reddit_timestamp(dt_attr)
+                
+                if not datetime_value:
+                    print(f"⛔ No valid timestamp for post {post_id}")
+                    continue
 
-            if not datetime_value:
-                print("⛔ No timestamp")
+                # Check age
+                age_hours = (datetime.utcnow() - datetime_value).total_seconds() / 3600.0
+                if age_hours > POST_MAX_AGE_HOURS:
+                    print(f"⛔ Too old ({round(age_hours, 1)}h): {post_id}")
+                    continue
+
+                # Parse score
+                score = parse_score(score_raw)
+
+                print(f"✅ Valid post: {post_url} (score: {score}, age: {round(age_hours, 1)}h)")
+                await insert_reddit_post(
+                    conn,
+                    subreddit,
+                    post_id,
+                    post_url,
+                    score,
+                    datetime_value,
+                )
+                valid_count += 1
+
+            except Exception as e:
+                print(f"⚠️ Error processing individual post: {e}")
                 continue
-
-            age_hours = (
-                datetime.utcnow() - datetime_value.replace(tzinfo=None)
-            ).total_seconds() / 3600.0
-            if age_hours > POST_MAX_AGE_HOURS:
-                print(f"⛔ Too old ({round(age_hours)}h)")
-                continue
-
-            # ---- score ----
-            score = 0
-            if score_raw:
-                try:
-                    score = int(score_raw)
-                except ValueError:
-                    score = parse_score_text(score_raw)
-
-            print(f"✅ Valid new post: {post_url}")
-            await insert_reddit_post(
-                conn,
-                subreddit,
-                post_id,
-                post_url,
-                score,
-                datetime_value.replace(tzinfo=None),
-            )
-            valid_count += 1
 
         if valid_count == 0:
-            print(f"⚠ No suitable posts found for r/{subreddit}")
+            print(f"⚠️ No suitable posts found for r/{subreddit}")
+        else:
+            print(f"✅ Found {valid_count} valid posts in r/{subreddit}")
 
     except Exception as e:
         print(f"❌ Error scraping r/{subreddit}: {e}")
@@ -265,7 +282,7 @@ async def run_scraper():
                 try:
                     await scrape_subreddit(conn, page, subreddit)
                 except Exception as e:
-                    print(f"⚠ Error on r/{subreddit}: {e}")
+                    print(f"⚠️ Error on r/{subreddit}: {e}")
 
                 wait_s = random.randint(SUBREDDIT_COOLDOWN_MIN_SEC, SUBREDDIT_COOLDOWN_MAX_SEC)
                 print(f"⏳ Cooldown: {wait_s}s\n")
@@ -283,4 +300,3 @@ async def run_scraper():
 if __name__ == "__main__":
     print("🚀 Starting Reddit subreddit scraper...")
     asyncio.run(run_scraper())
-
