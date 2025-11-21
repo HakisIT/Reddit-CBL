@@ -47,6 +47,55 @@ def _validated_db_config() -> Dict[str, str]:
 async def connect_db():
     return await asyncpg.connect(**_validated_db_config())
 
+async def upsert_subreddit_description(conn, subreddit: str, description: str):
+    """Insert or update subreddit description text."""
+    query = """
+        INSERT INTO reddit_subreddits (subreddit, description, updated_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (subreddit) DO UPDATE
+        SET description = EXCLUDED.description,
+            updated_at = NOW();
+    """
+    await conn.execute(query, subreddit, description)
+    print(f"📝 Updated description for r/{subreddit} ({len(description)} chars)")
+
+async def fetch_subreddit_description(conn, session: aiohttp.ClientSession, subreddit: str):
+    """Fetch subreddit description from Reddit's about.json and store it."""
+    url = f"https://www.reddit.com/r/{subreddit}/about.json"
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        async with session.get(url, headers=headers, timeout=15) as response:
+            if response.status == 403:
+                print(f"🚫 Forbidden while fetching about.json for r/{subreddit}")
+                return
+            if response.status == 429:
+                print(f"🚫 Rate limited on about.json for r/{subreddit}")
+                return
+            if response.status != 200:
+                print(f"❌ Unexpected status {response.status} for about.json r/{subreddit}")
+                return
+
+            data = await response.json()
+            sub_data = data.get("data", {}) if isinstance(data, dict) else {}
+
+            desc = sub_data.get("public_description") or sub_data.get("description") or ""
+            desc = desc.strip()
+
+            if not desc:
+                print(f"⚠️ No description found for r/{subreddit}")
+                return
+
+            await upsert_subreddit_description(conn, subreddit, desc)
+
+    except asyncio.TimeoutError:
+        print(f"⏱️ Timeout while fetching about.json for r/{subreddit}")
+    except Exception as e:
+        print(f"❌ Error fetching about.json for r/{subreddit}: {e}")
 
 async def insert_reddit_post(
     conn,
@@ -68,6 +117,7 @@ async def insert_reddit_post(
 async def scrape_subreddit_json(conn, session: aiohttp.ClientSession, subreddit: str):
     """Scrape subreddit using Reddit's JSON API"""
     print(f"\n🔍 Scraping r/{subreddit} ...")
+    await fetch_subreddit_description(conn, session, subreddit)
     
     # Reddit JSON API endpoint - add .json to any Reddit URL
     url = f"https://www.reddit.com/r/{subreddit}/hot.json"
